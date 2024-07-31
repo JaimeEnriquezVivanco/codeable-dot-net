@@ -16,9 +16,15 @@ public static class CachedInventoryApiBuilder
     builder.Services.AddSwaggerGen();
     builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
 
+    var cache = new ConcurrentDictionary<int, int>();
+    var timers = new ConcurrentDictionary<int, Timer>();
+
+    builder.Services.AddSingleton(timers);
+    builder.Services.AddSingleton(cache);
+
     var app = builder.Build();
 
-    var cache = new ConcurrentDictionary<int, int>();
+    var debounceDispatcher = new DebounceDispatcher(TimeSpan.FromMilliseconds(150));
 
     // Configure the HTTP request pipeline.
     if (app.Environment.IsDevelopment())
@@ -33,13 +39,18 @@ public static class CachedInventoryApiBuilder
       "/stock/{productId:int}",
       async (
         [FromServices] IWarehouseStockSystemClient client,
+        [FromServices] ConcurrentDictionary<int, int> cache,
         int productId
       ) =>
       {
-        // await client.GetStock(productId);
-        Debug.WriteLine("\nGetEP");
-        var stock = await GetStockFromCacheOrOldSystem(client, productId);
-        return stock;
+        if (cache.TryGetValue(productId, out var cachedStock))
+        {
+          return Results.Ok(cachedStock);
+        }
+
+        var stock = await client.GetStock(productId);
+        cache[productId] = stock;
+        return Results.Ok(stock);
       }
     )
       .WithName("GetStock")
@@ -49,6 +60,8 @@ public static class CachedInventoryApiBuilder
       "/stock/retrieve",
       async (
         [FromServices] IWarehouseStockSystemClient client,
+        [FromServices] ConcurrentDictionary<int, int> cache,
+        [FromServices] ConcurrentDictionary<int, Timer> timers,
         [FromBody] RetrieveStockRequest req
       ) =>
       {
@@ -64,13 +77,13 @@ public static class CachedInventoryApiBuilder
         Debug.WriteLine($"{req}");
 
         var productId = req.ProductId;
-        var stock = await GetStockFromCacheOrOldSystem(client, productId);
+        var stock = await GetStockFromCacheOrOldSystem(client, cache, productId);
 
-        if (stock < req.Amount)
-        {
-          Debug.WriteLine("\tNot enough stock");
-          return Results.BadRequest("Not enough stock.");
-        }
+        // if (stock < req.Amount)
+        // {
+        //   Debug.WriteLine("\tNot enough stock");
+        //   return Results.BadRequest("Not enough stock.");
+        // }
 
         Debug.WriteLine("\tUpdating cache");
 
@@ -81,7 +94,10 @@ public static class CachedInventoryApiBuilder
         cache.AddOrUpdate(
           productId,
           newQty,
-          (k, oldValue) => oldValue - req.Amount
+          (k, oldValue) => {
+            // client.UpdateStock(productId, oldValue - req.Amount);
+            return oldValue - req.Amount;
+          }
         );
 
         cache.TryGetValue(productId, out var testito);
@@ -89,8 +105,12 @@ public static class CachedInventoryApiBuilder
 
 
         Debug.WriteLine("\tUpdating old API");
-        var updtTask = client.UpdateStock(productId, testito); //2.5s
-          
+        // var updtTask = client.UpdateStock(productId, testito); //2.5s
+        // debounceDispatcher.Debounce(
+        //   async () => await client.UpdateStock(productId, testito)
+        // );
+        ResetTimer(req.ProductId, client, cache, timers);
+
         return Results.Ok();
       }
     )
@@ -110,7 +130,7 @@ public static class CachedInventoryApiBuilder
         Debug.WriteLine($"{req}");
 
         var productId = req.ProductId;
-        var stock = await GetStockFromCacheOrOldSystem(client, productId);
+        var stock = await GetStockFromCacheOrOldSystem(client, cache, productId);
 
         Debug.WriteLine("\tUpdating cache");
         Debug.WriteLine($"\t\tFrom: {stock} pc");
@@ -123,8 +143,7 @@ public static class CachedInventoryApiBuilder
 
         Debug.WriteLine("\tUpdating old system");
         Debug.WriteLine($"\t\tFrom: {cache[productId]} pc");
-        var newStock = stock + req.Amount;
-        await client.UpdateStock(productId, newStock); //2.5s
+        await client.UpdateStock(productId, stk + req.Amount); //2.5s
         
         return Results.Ok();
       }
@@ -133,10 +152,11 @@ public static class CachedInventoryApiBuilder
       .WithOpenApi();
 
     return app;
-  
-    async Task<int> GetStockFromCacheOrOldSystem
+
+    static async Task<int> GetStockFromCacheOrOldSystem
     (
     [FromServices] IWarehouseStockSystemClient oldSystem,
+    [FromServices] ConcurrentDictionary<int, int> cache,
       int itemId
     )
     {
@@ -159,6 +179,40 @@ public static class CachedInventoryApiBuilder
         cache.TryGetValue(itemId, out var ans2);
         Debug.WriteLine($"\tReturning stock of: {ans2}");
         return ans2;
+    }
+
+    
+  }
+  private static void ResetTimer(
+    int productId,
+    IWarehouseStockSystemClient client,
+    ConcurrentDictionary<int, int> cache,
+    ConcurrentDictionary<int, Timer> timers
+  )
+  {
+    if (timers.TryGetValue(productId, out var existingTimer))
+    {
+      existingTimer.Change(500, Timeout.Infinite);
+    }
+    else
+    {
+      var newTimer = new Timer(
+        async state =>
+        {
+          if (state != null)
+          {
+            var pid = (int)state;
+            if (cache.TryGetValue(pid, out var stock))
+            {
+              await client.UpdateStock(pid, stock);
+            }
+          }
+        },
+        productId,
+        500,
+        Timeout.Infinite
+      );
+      timers[productId] = newTimer;
     }
   }
 }
